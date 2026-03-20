@@ -126,6 +126,40 @@ Once the container is running, see the [Accessing the demo app](#accessing-the-d
 This example shows how to use the Google Cloud Application Default Credentials to authenticate with Vertex.
 You can also set `GOOGLE_APPLICATION_CREDENTIALS` to use an arbitrary credential file, see the [Google Cloud Authentication documentation](https://cloud.google.com/docs/authentication/application-default-credentials#GAC) for more details.
 
+### OpenAI
+
+```bash
+export OPENAI_API_KEY=%your_openai_api_key%
+docker run \
+    -e API_PROVIDER=openai \
+    -e OPENAI_API_KEY=$OPENAI_API_KEY \
+    -v $HOME/.anthropic:/home/computeruse/.anthropic \
+    -p 5900:5900 \
+    -p 8501:8501 \
+    -p 6080:6080 \
+    -p 8080:8080 \
+    -it computer-use-demo
+```
+
+The default model is `gpt-4.1`. You can change the model in the sidebar after launching.
+
+### Gemini
+
+```bash
+export GEMINI_API_KEY=%your_gemini_api_key%
+docker run \
+    -e API_PROVIDER=gemini \
+    -e GEMINI_API_KEY=$GEMINI_API_KEY \
+    -v $HOME/.anthropic:/home/computeruse/.anthropic \
+    -p 5900:5900 \
+    -p 8501:8501 \
+    -p 6080:6080 \
+    -p 8080:8080 \
+    -it computer-use-demo
+```
+
+The default model is `gemini-2.5-pro`. You can change the model in the sidebar after launching.
+
 ### Accessing the demo app
 
 Once the container is running, open your browser to [http://localhost:8080](http://localhost:8080) to access the combined interface that includes both the agent chat and desktop view.

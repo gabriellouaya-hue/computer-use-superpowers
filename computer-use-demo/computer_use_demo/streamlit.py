@@ -13,16 +13,10 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PosixPath
-from typing import cast, get_args
+from typing import Any, cast, get_args
 
 import httpx
 import streamlit as st
-from anthropic import RateLimitError
-from anthropic.types.beta import (
-    BetaContentBlockParam,
-    BetaTextBlockParam,
-    BetaToolResultBlockParam,
-)
 from streamlit.delta_generator import DeltaGenerator
 
 from computer_use_demo.loop import (
@@ -35,6 +29,8 @@ PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
     APIProvider.ANTHROPIC: "claude-sonnet-4-5-20250929",
     APIProvider.BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
     APIProvider.VERTEX: "claude-3-5-sonnet-v2@20241022",
+    APIProvider.OPENAI: "gpt-4.1",
+    APIProvider.GEMINI: "gemini-2.5-pro",
 }
 
 
@@ -74,6 +70,13 @@ HAIKU_4_5 = ModelConfig(
     has_thinking=False,
 )
 
+GENERIC_PROVIDER = ModelConfig(
+    tool_version="computer_use_20250124",
+    max_output_tokens=64_000,
+    default_output_tokens=1024 * 16,
+    has_thinking=False,
+)
+
 MODEL_TO_MODEL_CONF: dict[str, ModelConfig] = {
     "claude-opus-4-1-20250805": CLAUDE_4,
     "claude-sonnet-4-20250514": CLAUDE_4,
@@ -85,10 +88,22 @@ MODEL_TO_MODEL_CONF: dict[str, ModelConfig] = {
     "anthropic.claude-haiku-4-5-20251001-v1:0": HAIKU_4_5,  # Bedrock
     "claude-haiku-4-5@20251001": HAIKU_4_5,  # Vertex
     "claude-opus-4-5-20251101": CLAUDE_4_WITH_ZOOMABLE_TOOL,
+    # OpenAI defaults
+    "gpt-4.1": GENERIC_PROVIDER,
+    "gpt-4o": GENERIC_PROVIDER,
+    "gpt-4o-mini": GENERIC_PROVIDER,
+    "o3": GENERIC_PROVIDER,
+    "o4-mini": GENERIC_PROVIDER,
+    # Gemini defaults
+    "gemini-2.5-pro": GENERIC_PROVIDER,
+    "gemini-2.5-flash": GENERIC_PROVIDER,
+    "gemini-2.0-flash": GENERIC_PROVIDER,
 }
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
+OPENAI_API_KEY_FILE = CONFIG_DIR / "openai_api_key"
+GEMINI_API_KEY_FILE = CONFIG_DIR / "gemini_api_key"
 STREAMLIT_STYLE = """
 <style>
     /* Highlight the stop button in red */
@@ -128,6 +143,14 @@ def setup_state():
         st.session_state.api_key = load_from_storage("api_key") or os.getenv(
             "ANTHROPIC_API_KEY", ""
         )
+    if "openai_api_key" not in st.session_state:
+        st.session_state.openai_api_key = load_from_storage("openai_api_key") or os.getenv(
+            "OPENAI_API_KEY", ""
+        )
+    if "gemini_api_key" not in st.session_state:
+        st.session_state.gemini_api_key = load_from_storage("gemini_api_key") or os.getenv(
+            "GEMINI_API_KEY", ""
+        )
     if "provider" not in st.session_state:
         st.session_state.provider = (
             os.getenv("API_PROVIDER", "anthropic") or APIProvider.ANTHROPIC
@@ -162,9 +185,10 @@ def _reset_model():
 
 
 def _reset_model_conf():
-    model_conf = (
-        MODEL_TO_MODEL_CONF.get(st.session_state.model, CLAUDE_4)  # Default fallback
-    )
+    # Use GENERIC_PROVIDER as fallback for non-Anthropic providers
+    provider = st.session_state.get("provider", "anthropic")
+    fallback = GENERIC_PROVIDER if provider in ("openai", "gemini") else CLAUDE_4
+    model_conf = MODEL_TO_MODEL_CONF.get(st.session_state.model, fallback)
 
     # If we're in radio selection mode, use the selected tool version
     if hasattr(st.session_state, "tool_versions"):
@@ -206,7 +230,7 @@ async def main():
 
     st.markdown(STREAMLIT_STYLE, unsafe_allow_html=True)
 
-    st.title("Claude Computer Use Demo")
+    st.title("Computer Use Demo")
 
     if not os.getenv("HIDE_WARNING", False):
         st.warning(WARNING_TEXT)
@@ -230,12 +254,26 @@ async def main():
 
         st.text_input("Model", key="model", on_change=_reset_model_conf)
 
-        if st.session_state.provider == APIProvider.ANTHROPIC:
+        if st.session_state.provider in (APIProvider.ANTHROPIC, APIProvider.BEDROCK, APIProvider.VERTEX):
             st.text_input(
-                "Claude API Key",
+                "Anthropic API Key",
                 type="password",
                 key="api_key",
                 on_change=lambda: save_to_storage("api_key", st.session_state.api_key),
+            )
+        elif st.session_state.provider == APIProvider.OPENAI:
+            st.text_input(
+                "OpenAI API Key",
+                type="password",
+                key="openai_api_key",
+                on_change=lambda: save_to_storage("openai_api_key", st.session_state.openai_api_key),
+            )
+        elif st.session_state.provider == APIProvider.GEMINI:
+            st.text_input(
+                "Gemini API Key",
+                type="password",
+                key="gemini_api_key",
+                on_change=lambda: save_to_storage("gemini_api_key", st.session_state.gemini_api_key),
             )
 
         st.number_input(
@@ -303,7 +341,7 @@ async def main():
 
     chat, http_logs = st.tabs(["Chat", "HTTP Exchange Logs"])
     new_message = st.chat_input(
-        "Type a message to send to Claude to control the computer..."
+        "Type a message to send to the AI to control the computer..."
     )
 
     with chat:
@@ -322,7 +360,7 @@ async def main():
                     else:
                         _render_message(
                             message["role"],
-                            cast(BetaContentBlockParam | ToolResult, block),
+                            cast(dict[str, Any] | ToolResult, block),
                         )
 
         # render past http exchanges
@@ -336,7 +374,7 @@ async def main():
                     "role": Sender.USER,
                     "content": [
                         *maybe_add_interruption_blocks(),
-                        BetaTextBlockParam(type="text", text=new_message),
+                        {"type": "text", "text": new_message},
                     ],
                 }
             )
@@ -353,6 +391,9 @@ async def main():
 
         with track_sampling_loop():
             # run the agent sampling loop with the newest message
+            # Resolve the correct API key for the active provider
+            active_api_key = _get_active_api_key()
+
             st.session_state.messages = await sampling_loop(
                 system_prompt_suffix=st.session_state.custom_system_prompt,
                 model=st.session_state.model,
@@ -367,7 +408,7 @@ async def main():
                     tab=http_logs,
                     response_state=st.session_state.responses,
                 ),
-                api_key=st.session_state.api_key,
+                api_key=active_api_key,
                 only_n_most_recent_images=st.session_state.only_n_most_recent_images,
                 tool_version=st.session_state.tool_versions,
                 max_tokens=st.session_state.output_tokens,
@@ -376,6 +417,18 @@ async def main():
                 else None,
                 token_efficient_tools_beta=st.session_state.token_efficient_tools_beta,
             )
+
+
+def _get_active_api_key() -> str:
+    """Return the API key for the currently selected provider."""
+    provider = st.session_state.provider
+    if provider in (APIProvider.ANTHROPIC, APIProvider.BEDROCK, APIProvider.VERTEX):
+        return st.session_state.api_key
+    elif provider == APIProvider.OPENAI:
+        return st.session_state.openai_api_key
+    elif provider == APIProvider.GEMINI:
+        return st.session_state.gemini_api_key
+    return st.session_state.api_key
 
 
 def maybe_add_interruption_blocks():
@@ -390,15 +443,13 @@ def maybe_add_interruption_blocks():
     ]
     for tool_use_id in previous_tool_use_ids:
         st.session_state.tools[tool_use_id] = ToolResult(error=INTERRUPT_TOOL_ERROR)
-        result.append(
-            BetaToolResultBlockParam(
-                tool_use_id=tool_use_id,
-                type="tool_result",
-                content=INTERRUPT_TOOL_ERROR,
-                is_error=True,
-            )
-        )
-    result.append(BetaTextBlockParam(type="text", text=INTERRUPT_TEXT))
+        result.append({
+            "tool_use_id": tool_use_id,
+            "type": "tool_result",
+            "content": INTERRUPT_TOOL_ERROR,
+            "is_error": True,
+        })
+    result.append({"type": "text", "text": INTERRUPT_TEXT})
     return result
 
 
@@ -412,7 +463,7 @@ def track_sampling_loop():
 def validate_auth(provider: APIProvider, api_key: str | None):
     if provider == APIProvider.ANTHROPIC:
         if not api_key:
-            return "Enter your Claude API key in the sidebar to continue."
+            return "Enter your Anthropic API key in the sidebar to continue."
     if provider == APIProvider.BEDROCK:
         import boto3
 
@@ -430,6 +481,12 @@ def validate_auth(provider: APIProvider, api_key: str | None):
             )
         except DefaultCredentialsError:
             return "Your google cloud credentials are not set up correctly."
+    if provider == APIProvider.OPENAI:
+        if not st.session_state.get("openai_api_key"):
+            return "Enter your OpenAI API key in the sidebar to continue."
+    if provider == APIProvider.GEMINI:
+        if not st.session_state.get("gemini_api_key"):
+            return "Enter your Gemini API key in the sidebar to continue."
 
 
 def load_from_storage(filename: str) -> str | None:
@@ -458,11 +515,11 @@ def save_to_storage(filename: str, data: str) -> None:
 
 
 def _api_response_callback(
-    request: httpx.Request,
-    response: httpx.Response | object | None,
+    request: Any,
+    response: Any,
     error: Exception | None,
     tab: DeltaGenerator,
-    response_state: dict[str, tuple[httpx.Request, httpx.Response | object | None]],
+    response_state: dict[str, tuple[Any, Any]],
 ):
     """
     Handle an API response by storing it to state and rendering it.
@@ -483,8 +540,8 @@ def _tool_output_callback(
 
 
 def _render_api_response(
-    request: httpx.Request,
-    response: httpx.Response | object | None,
+    request: Any,
+    response: Any,
     response_id: str,
     tab: DeltaGenerator,
 ):
@@ -492,27 +549,38 @@ def _render_api_response(
     with tab:
         with st.expander(f"Request/Response ({response_id})"):
             newline = "\n\n"
-            st.markdown(
-                f"`{request.method} {request.url}`{newline}{newline.join(f'`{k}: {v}`' for k, v in request.headers.items())}"
-            )
-            st.json(request.read().decode())
+            if isinstance(request, httpx.Request):
+                st.markdown(
+                    f"`{request.method} {request.url}`{newline}{newline.join(f'`{k}: {v}`' for k, v in request.headers.items())}"
+                )
+                st.json(request.read().decode())
+            elif request is not None:
+                st.write(f"Request: {request}")
+            else:
+                st.write("Request: N/A (non-Anthropic provider)")
             st.markdown("---")
             if isinstance(response, httpx.Response):
                 st.markdown(
                     f"`{response.status_code}`{newline}{newline.join(f'`{k}: {v}`' for k, v in response.headers.items())}"
                 )
                 st.json(response.text)
+            elif response is not None:
+                st.write(str(response))
             else:
-                st.write(response)
+                st.write("Response: N/A")
 
 
 def _render_error(error: Exception):
-    if isinstance(error, RateLimitError):
-        body = "You have been rate limited."
-        if retry_after := error.response.headers.get("retry-after"):
-            body += f" **Retry after {str(timedelta(seconds=int(retry_after)))} (HH:MM:SS).** See our API [documentation](https://docs.claude.com/en/api/rate-limits) for more details."
-        body += f"\n\n{error.message}"
-    else:
+    try:
+        from anthropic import RateLimitError
+        if isinstance(error, RateLimitError):
+            body = "You have been rate limited."
+            if retry_after := error.response.headers.get("retry-after"):
+                body += f" **Retry after {str(timedelta(seconds=int(retry_after)))} (HH:MM:SS).** See our API [documentation](https://docs.claude.com/en/api/rate-limits) for more details."
+            body += f"\n\n{error.message}"
+        else:
+            raise ImportError  # fall through to generic handler
+    except ImportError:
         body = str(error)
         body += "\n\n**Traceback:**"
         lines = "\n".join(traceback.format_exception(error))
@@ -523,7 +591,7 @@ def _render_error(error: Exception):
 
 def _render_message(
     sender: Sender,
-    message: str | BetaContentBlockParam | ToolResult,
+    message: str | dict[str, Any] | ToolResult,
 ):
     """Convert input from the user or output from the agent to a streamlit message."""
     # streamlit's hotreloading breaks isinstance checks, so we need to check for class names

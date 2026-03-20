@@ -1,5 +1,7 @@
 """
-Agentic sampling loop that calls the Claude API and local implementation of anthropic-defined computer use tools.
+Agentic sampling loop that calls LLM providers and local implementation of computer use tools.
+
+Supports Anthropic (direct / Bedrock / Vertex), OpenAI, and Google Gemini.
 """
 
 import platform
@@ -9,27 +11,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
-import httpx
-from anthropic import (
-    Anthropic,
-    AnthropicBedrock,
-    AnthropicVertex,
-    APIError,
-    APIResponseValidationError,
-    APIStatusError,
+from .providers import PROVIDER_MAP
+from .providers.types import (
+    ToolDefinition,
+    UnifiedContentBlock,
+    UnifiedResponse,
+    UnifiedTextBlock,
+    UnifiedThinkingBlock,
+    UnifiedToolUseBlock,
 )
-from anthropic.types.beta import (
-    BetaCacheControlEphemeralParam,
-    BetaContentBlockParam,
-    BetaImageBlockParam,
-    BetaMessage,
-    BetaMessageParam,
-    BetaTextBlock,
-    BetaTextBlockParam,
-    BetaToolResultBlockParam,
-    BetaToolUseBlockParam,
-)
-
 from .tools import (
     TOOL_GROUPS_BY_VERSION,
     ToolCollection,
@@ -37,7 +27,6 @@ from .tools import (
     ToolVersion,
 )
 
-PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
 MANDATORY_SKILL_PATH = Path(__file__).resolve().parent / "skills" / "using-superpowers.md"
 
 
@@ -45,6 +34,8 @@ class APIProvider(StrEnum):
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"
     VERTEX = "vertex"
+    OPENAI = "openai"
+    GEMINI = "gemini"
 
 
 # This system prompt is optimized for the Docker environment in this repository and
@@ -85,11 +76,11 @@ async def sampling_loop(
     model: str,
     provider: APIProvider,
     system_prompt_suffix: str,
-    messages: list[BetaMessageParam],
-    output_callback: Callable[[BetaContentBlockParam], None],
+    messages: list[dict[str, Any]],
+    output_callback: Callable[[dict[str, Any]], None],
     tool_output_callback: Callable[[ToolResult, str], None],
     api_response_callback: Callable[
-        [httpx.Request, httpx.Response | object | None, Exception | None], None
+        [Any, Any, Exception | None], None
     ],
     api_key: str,
     only_n_most_recent_images: int | None = None,
@@ -100,41 +91,29 @@ async def sampling_loop(
 ):
     """
     Agentic sampling loop for the assistant/tool interaction of computer use.
+    Works with Anthropic, OpenAI, and Gemini via the provider adapter layer.
     """
     tool_group = TOOL_GROUPS_BY_VERSION[tool_version]
     tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))
     mandatory_skill_prompt = _load_mandatory_skill_prompt()
-    system = BetaTextBlockParam(
-        type="text",
-        text=(
-            f"{SYSTEM_PROMPT}"
-            f"{mandatory_skill_prompt}"
-            f"{' ' + system_prompt_suffix if system_prompt_suffix else ''}"
-        ),
+    system_text = (
+        f"{SYSTEM_PROMPT}"
+        f"{mandatory_skill_prompt}"
+        f"{' ' + system_prompt_suffix if system_prompt_suffix else ''}"
     )
 
-    while True:
-        enable_prompt_caching = False
-        betas = [tool_group.beta_flag] if tool_group.beta_flag else []
-        if token_efficient_tools_beta:
-            betas.append("token-efficient-tools-2025-02-19")
-        image_truncation_threshold = only_n_most_recent_images or 0
-        if provider == APIProvider.ANTHROPIC:
-            client = Anthropic(api_key=api_key, max_retries=4)
-            enable_prompt_caching = True
-        elif provider == APIProvider.VERTEX:
-            client = AnthropicVertex()
-        elif provider == APIProvider.BEDROCK:
-            client = AnthropicBedrock()
+    # Resolve provider adapter
+    adapter_cls = _resolve_adapter(provider)
+    adapter_kwargs: dict[str, Any] = {}
+    if provider in (APIProvider.BEDROCK, APIProvider.VERTEX):
+        adapter_kwargs["sub_provider"] = provider.value
+    adapter = adapter_cls(api_key=api_key, **adapter_kwargs)
 
-        if enable_prompt_caching:
-            betas.append(PROMPT_CACHING_BETA_FLAG)
-            _inject_prompt_caching(messages)
-            # Because cached reads are 10% of the price, we don't think it's
-            # ever sensible to break the cache by truncating images
-            only_n_most_recent_images = 0
-            # Use type ignore to bypass TypedDict check until SDK types are updated
-            system["cache_control"] = {"type": "ephemeral"}  # type: ignore
+    # Convert tool collection to unified ToolDefinitions
+    tool_definitions = _tool_collection_to_definitions(tool_collection)
+
+    while True:
+        image_truncation_threshold = only_n_most_recent_images or 0
 
         if only_n_most_recent_images:
             _maybe_filter_to_n_most_recent_images(
@@ -142,41 +121,37 @@ async def sampling_loop(
                 only_n_most_recent_images,
                 min_removal_threshold=image_truncation_threshold,
             )
-        extra_body = {}
-        if thinking_budget:
-            # Ensure we only send the required fields for thinking
-            extra_body = {
-                "thinking": {"type": "enabled", "budget_tokens": thinking_budget}
-            }
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
-        try:
-            raw_response = client.beta.messages.with_raw_response.create(
-                max_tokens=max_tokens,
-                messages=messages,
-                model=model,
-                system=[system],
-                tools=tool_collection.to_params(),
-                betas=betas,
-                extra_body=extra_body,
-            )
-        except (APIStatusError, APIResponseValidationError) as e:
-            api_response_callback(e.request, e.response, e)
-            return messages
-        except APIError as e:
-            api_response_callback(e.request, e.body, e)
-            return messages
+        # Build extra params for provider-specific features
+        extra: dict[str, Any] = {}
+        betas = [tool_group.beta_flag] if tool_group.beta_flag else []
+        if token_efficient_tools_beta:
+            extra["token_efficient_tools_beta"] = True
+        extra["betas"] = betas
 
-        api_response_callback(
-            raw_response.http_response.request, raw_response.http_response, None
+        # Call the provider adapter
+        response: UnifiedResponse = await adapter.send_message(
+            model=model,
+            system=system_text,
+            messages=messages,
+            tools=tool_definitions,
+            max_tokens=max_tokens,
+            thinking_budget=thinking_budget if adapter.supports_thinking() else None,
+            extra=extra,
         )
 
-        response = raw_response.parse()
+        # Notify the UI about the raw request/response for logging
+        api_response_callback(
+            response.raw_request,
+            response.raw_response,
+            None if response.stop_reason != "error" else Exception(str(response.content)),
+        )
 
-        response_params = _response_to_params(response)
+        if response.stop_reason == "error":
+            return messages
+
+        # Convert unified response to message-history dict format
+        response_params = _unified_to_params(response.content)
         messages.append(
             {
                 "role": "assistant",
@@ -184,23 +159,21 @@ async def sampling_loop(
             }
         )
 
-        tool_result_content: list[BetaToolResultBlockParam] = []
+        tool_result_content: list[dict[str, Any]] = []
         for content_block in response_params:
             output_callback(content_block)
             if (
                 isinstance(content_block, dict)
                 and content_block.get("type") == "tool_use"
             ):
-                # Type narrowing for tool use blocks
-                tool_use_block = cast(BetaToolUseBlockParam, content_block)
                 result = await tool_collection.run(
-                    name=tool_use_block["name"],
-                    tool_input=cast(dict[str, Any], tool_use_block.get("input", {})),
+                    name=content_block["name"],
+                    tool_input=cast(dict[str, Any], content_block.get("input", {})),
                 )
                 tool_result_content.append(
-                    _make_api_tool_result(result, tool_use_block["id"])
+                    _make_api_tool_result(result, content_block["id"])
                 )
-                tool_output_callback(result, tool_use_block["id"])
+                tool_output_callback(result, content_block["id"])
 
         if not tool_result_content:
             return messages
@@ -208,8 +181,69 @@ async def sampling_loop(
         messages.append({"content": tool_result_content, "role": "user"})
 
 
+def _resolve_adapter(provider: APIProvider):
+    """Map an APIProvider enum value to the correct adapter class."""
+    from .providers import PROVIDER_MAP
+
+    if provider in (APIProvider.ANTHROPIC, APIProvider.BEDROCK, APIProvider.VERTEX):
+        return PROVIDER_MAP["anthropic"]
+    elif provider == APIProvider.OPENAI:
+        return PROVIDER_MAP["openai"]
+    elif provider == APIProvider.GEMINI:
+        return PROVIDER_MAP["gemini"]
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+def _tool_collection_to_definitions(tool_collection: ToolCollection) -> list[ToolDefinition]:
+    """Convert a ToolCollection into a list of provider-agnostic ToolDefinitions."""
+    definitions: list[ToolDefinition] = []
+    for tool in tool_collection.tools:
+        params = cast(dict[str, Any], tool.to_params())
+        name = params.get("name", "")
+        tool_type = params.get("type", "custom")
+        description = params.get("description", None)
+        input_schema = params.get("input_schema", None)
+        # Collect extra keys (e.g. display_width_px, display_height_px for computer tool)
+        known_keys = {"name", "type", "description", "input_schema"}
+        extra = {k: v for k, v in params.items() if k not in known_keys}
+        definitions.append(
+            ToolDefinition(
+                name=name,
+                type=tool_type,
+                description=description,
+                input_schema=input_schema,
+                extra=extra,
+            )
+        )
+    return definitions
+
+
+def _unified_to_params(content: list[UnifiedContentBlock]) -> list[dict[str, Any]]:
+    """Convert unified content blocks into the dict format used by the message history."""
+    params: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, UnifiedTextBlock):
+            params.append({"type": "text", "text": block.text})
+        elif isinstance(block, UnifiedThinkingBlock):
+            entry: dict[str, Any] = {
+                "type": "thinking",
+                "thinking": block.thinking,
+            }
+            if block.signature:
+                entry["signature"] = block.signature
+            params.append(entry)
+        elif isinstance(block, UnifiedToolUseBlock):
+            params.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
+    return params
+
+
 def _maybe_filter_to_n_most_recent_images(
-    messages: list[BetaMessageParam],
+    messages: list[dict[str, Any]],
     images_to_keep: int,
     min_removal_threshold: int,
 ):
@@ -222,17 +256,14 @@ def _maybe_filter_to_n_most_recent_images(
     if images_to_keep is None:
         return messages
 
-    tool_result_blocks = cast(
-        list[BetaToolResultBlockParam],
-        [
-            item
-            for message in messages
-            for item in (
-                message["content"] if isinstance(message["content"], list) else []
-            )
-            if isinstance(item, dict) and item.get("type") == "tool_result"
-        ],
-    )
+    tool_result_blocks = [
+        item
+        for message in messages
+        for item in (
+            message["content"] if isinstance(message["content"], list) else []
+        )
+        if isinstance(item, dict) and item.get("type") == "tool_result"
+    ]
 
     total_images = sum(
         1
@@ -257,60 +288,11 @@ def _maybe_filter_to_n_most_recent_images(
             tool_result["content"] = new_content
 
 
-def _response_to_params(
-    response: BetaMessage,
-) -> list[BetaContentBlockParam]:
-    res: list[BetaContentBlockParam] = []
-    for block in response.content:
-        if isinstance(block, BetaTextBlock):
-            if block.text:
-                res.append(BetaTextBlockParam(type="text", text=block.text))
-            elif getattr(block, "type", None) == "thinking":
-                # Handle thinking blocks - include signature field
-                thinking_block = {
-                    "type": "thinking",
-                    "thinking": getattr(block, "thinking", None),
-                }
-                if hasattr(block, "signature"):
-                    thinking_block["signature"] = getattr(block, "signature", None)
-                res.append(cast(BetaContentBlockParam, thinking_block))
-        else:
-            # Handle tool use blocks normally
-            res.append(cast(BetaToolUseBlockParam, block.model_dump()))
-    return res
-
-
-def _inject_prompt_caching(
-    messages: list[BetaMessageParam],
-):
-    """
-    Set cache breakpoints for the 3 most recent turns
-    one cache breakpoint is left for tools/system prompt, to be shared across sessions
-    """
-
-    breakpoints_remaining = 3
-    for message in reversed(messages):
-        if message["role"] == "user" and isinstance(
-            content := message["content"], list
-        ):
-            if breakpoints_remaining:
-                breakpoints_remaining -= 1
-                # Use type ignore to bypass TypedDict check until SDK types are updated
-                content[-1]["cache_control"] = BetaCacheControlEphemeralParam(  # type: ignore
-                    {"type": "ephemeral"}
-                )
-            else:
-                if isinstance(content[-1], dict) and "cache_control" in content[-1]:
-                    del content[-1]["cache_control"]  # type: ignore
-                # we'll only every have one extra turn per loop
-                break
-
-
 def _make_api_tool_result(
     result: ToolResult, tool_use_id: str
-) -> BetaToolResultBlockParam:
-    """Convert an agent ToolResult to an API ToolResultBlockParam."""
-    tool_result_content: list[BetaTextBlockParam | BetaImageBlockParam] | str = []
+) -> dict[str, Any]:
+    """Convert an agent ToolResult to a tool_result dict for the message history."""
+    tool_result_content: list[dict[str, Any]] | str = []
     is_error = False
     if result.error:
         is_error = True
