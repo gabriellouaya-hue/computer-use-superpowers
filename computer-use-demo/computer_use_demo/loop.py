@@ -6,6 +6,7 @@ import platform
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -37,6 +38,7 @@ from .tools import (
 )
 
 PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
+MANDATORY_SKILL_PATH = Path(__file__).resolve().parent / "skills" / "using-superpowers.md"
 
 
 class APIProvider(StrEnum):
@@ -58,13 +60,24 @@ SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
 * When using your bash tool with commands that are expected to output very large quantities of text, redirect into a tmp file and use str_replace_based_edit_tool or `grep -n -B <lines before> -A <lines after> <query> <filename>` to confirm output.
 * When viewing a page it can be helpful to zoom out so that you can see everything on the page.  Either that, or make sure you scroll down to see everything before deciding something isn't available.
 * When using your computer function calls, they take a while to run and send back to you.  Where possible/feasible, try to chain multiple of these calls all into one function calls request.
+* You have access to a skill tool containing reusable workflows. For multi-step tasks or recurring patterns, consult the skill tool before acting so you can follow an established procedure when one is available.
 * The current date is {datetime.today().strftime("%A, %B %-d, %Y")}.
 </SYSTEM_CAPABILITY>
 
 <IMPORTANT>
 * When using Firefox, if a startup wizard appears, IGNORE IT.  Do not even click "skip this step".  Instead, click on the address bar where it says "Search or enter address", and enter the appropriate search term or URL there.
 * If the item you are looking at is a pdf, if after taking a single screenshot of the pdf it seems that you want to read the entire document instead of trying to continue to read the pdf from your screenshots + navigation, determine the URL, use curl to download the pdf, install and use pdftotext to convert it to a text file, and then read that text file directly with your str_replace_based_edit_tool.
+* Before starting a task that involves browsing, research, editing files, or planning several steps, consider calling the skill tool to list, search, or read the most relevant workflow.
 </IMPORTANT>"""
+
+
+def _load_mandatory_skill_prompt() -> str:
+    if not MANDATORY_SKILL_PATH.exists():
+        return ""
+    skill_text = MANDATORY_SKILL_PATH.read_text().strip()
+    if not skill_text:
+        return ""
+    return f"\n\n<MANDATORY_SKILL>\nYou must follow the mandatory skill below for every user task.\n\n{skill_text}\n</MANDATORY_SKILL>"
 
 
 async def sampling_loop(
@@ -90,9 +103,14 @@ async def sampling_loop(
     """
     tool_group = TOOL_GROUPS_BY_VERSION[tool_version]
     tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))
+    mandatory_skill_prompt = _load_mandatory_skill_prompt()
     system = BetaTextBlockParam(
         type="text",
-        text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
+        text=(
+            f"{SYSTEM_PROMPT}"
+            f"{mandatory_skill_prompt}"
+            f"{' ' + system_prompt_suffix if system_prompt_suffix else ''}"
+        ),
     )
 
     while True:

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
-from pathlib import PosixPath
+from pathlib import Path, PosixPath
 from typing import cast, get_args
 
 import httpx
@@ -110,6 +110,8 @@ STREAMLIT_STYLE = """
 WARNING_TEXT = "⚠️ Security Alert: Never provide access to sensitive accounts or data, as malicious web content can hijack Claude's behavior"
 INTERRUPT_TEXT = "(user stopped or interrupted and wrote the following)"
 INTERRUPT_TOOL_ERROR = "human stopped or interrupted tool execution"
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+MANDATORY_SKILL_NAME = "using-superpowers"
 
 
 class Sender(StrEnum):
@@ -174,6 +176,28 @@ def _reset_model_conf():
     st.session_state.output_tokens = model_conf.default_output_tokens
     st.session_state.max_output_tokens = model_conf.max_output_tokens
     st.session_state.thinking_budget = int(model_conf.default_output_tokens / 2)
+
+
+def get_active_skills() -> list[str]:
+    active_skills: list[str] = []
+    mandatory_skill_path = SKILLS_DIR / f"{MANDATORY_SKILL_NAME}.md"
+    if mandatory_skill_path.exists():
+        active_skills.append(MANDATORY_SKILL_NAME)
+    return active_skills
+
+
+def render_active_skills() -> None:
+    active_skills = get_active_skills()
+    st.markdown("### Skills Ativas")
+    if not active_skills:
+        st.caption("Nenhuma skill ativa no momento.")
+        return
+    for skill_name in active_skills:
+        skill_label = skill_name.replace("-", " ").title()
+        if skill_name == MANDATORY_SKILL_NAME:
+            st.success(f"{skill_label} (obrigatória)")
+        else:
+            st.info(skill_label)
 
 
 async def main():
@@ -255,6 +279,9 @@ async def main():
             step=1,
             disabled=not st.session_state.thinking,
         )
+
+        st.divider()
+        render_active_skills()
 
         if st.button("Reset", type="primary"):
             with st.spinner("Resetting..."):

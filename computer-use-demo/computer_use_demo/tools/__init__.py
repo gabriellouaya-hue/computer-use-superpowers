@@ -4,6 +4,7 @@ from .collection import ToolCollection
 from .computer import ComputerTool20241022, ComputerTool20250124
 from .edit import EditTool20250728
 from .groups import TOOL_GROUPS_BY_VERSION, ToolVersion
+from .skill import SkillTool
 
 __ALL__ = [
     BashTool20241022,
@@ -12,6 +13,7 @@ __ALL__ = [
     ComputerTool20241022,
     ComputerTool20250124,
     EditTool20250728,
+    SkillTool,
     TOOL_GROUPS_BY_VERSION,
     ToolCollection,
     ToolResult,

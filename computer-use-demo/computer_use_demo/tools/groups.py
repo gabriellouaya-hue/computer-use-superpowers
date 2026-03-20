@@ -5,6 +5,7 @@ from .base import BaseAnthropicTool
 from .bash import BashTool20241022, BashTool20250124
 from .computer import ComputerTool20241022, ComputerTool20250124, ComputerTool20251124
 from .edit import EditTool20250728
+from .skill import SkillTool
 
 ToolVersion = Literal[
     "computer_use_20250124",
@@ -30,22 +31,22 @@ class ToolGroup:
 TOOL_GROUPS: list[ToolGroup] = [
     ToolGroup(
         version="computer_use_20241022",
-        tools=[ComputerTool20241022, EditTool20250728, BashTool20241022],
+        tools=[ComputerTool20241022, EditTool20250728, BashTool20241022, SkillTool],
         beta_flag="computer-use-2024-10-22",
     ),
     ToolGroup(
         version="computer_use_20250124",
-        tools=[ComputerTool20250124, EditTool20250728, BashTool20250124],
+        tools=[ComputerTool20250124, EditTool20250728, BashTool20250124, SkillTool],
         beta_flag="computer-use-2025-01-24",
     ),
     ToolGroup(
         version="computer_use_20250429",
-        tools=[ComputerTool20250124, EditTool20250728, BashTool20250124],
+        tools=[ComputerTool20250124, EditTool20250728, BashTool20250124, SkillTool],
         beta_flag="computer-use-2025-01-24",
     ),
     ToolGroup(
         version="computer_use_20251124",
-        tools=[ComputerTool20251124, EditTool20250728, BashTool20250124],
+        tools=[ComputerTool20251124, EditTool20250728, BashTool20250124, SkillTool],
         beta_flag="computer-use-2025-11-24",
     ),
 ]
