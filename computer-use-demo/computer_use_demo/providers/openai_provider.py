@@ -64,7 +64,7 @@ class OpenAIProvider(BaseProviderAdapter):
                 model=model,
                 messages=oai_messages,
                 tools=oai_tools,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
             )
         except Exception as e:
             return UnifiedResponse(
