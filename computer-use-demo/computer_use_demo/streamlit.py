@@ -237,20 +237,17 @@ async def main():
 
     with st.sidebar:
 
-        def _reset_api_provider():
-            if st.session_state.provider_radio != st.session_state.provider:
-                _reset_model()
-                st.session_state.provider = st.session_state.provider_radio
-                st.session_state.auth_validated = False
-
         provider_options = [option.value for option in APIProvider]
-        st.radio(
+        selected_provider = st.radio(
             "API Provider",
             options=provider_options,
             key="provider_radio",
             format_func=lambda x: x.title(),
-            on_change=_reset_api_provider,
         )
+
+        if selected_provider != st.session_state.provider:
+            st.session_state.provider = selected_provider
+            _reset_model()
 
         st.text_input("Model", key="model", on_change=_reset_model_conf)
 
